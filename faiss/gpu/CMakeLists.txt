@@ -52,6 +52,7 @@ set(FAISS_GPU_SRC
   impl/L2Select.cu
   impl/PQScanMultiPassPrecomputed.cu
   impl/RemapIndices.cpp
+  impl/RerankKernels.cu
   impl/VectorResidual.cu
   impl/IcmEncoder.cu
   utils/BlockSelectFloat.cu
@@ -127,6 +128,7 @@ set(FAISS_GPU_HEADERS
   impl/PQScanMultiPassNoPrecomputed.cuh
   impl/PQScanMultiPassPrecomputed.cuh
   impl/RemapIndices.h
+  impl/RerankKernels.cuh
   impl/VectorResidual.cuh
   impl/scan/IVFInterleavedImpl.cuh
   impl/IcmEncoder.cuh

@@ -9,6 +9,7 @@
 #include <faiss/gpu/GpuResources.h>
 #include <faiss/gpu/impl/FlatIndex.cuh>
 #include <faiss/gpu/impl/Distance.cuh>
+#include <faiss/gpu/impl/RerankKernels.cuh>
 #include <faiss/gpu/utils/DeviceUtils.h>
 #include <faiss/gpu/utils/CopyUtils.cuh>
 #include <faiss/gpu/utils/DeviceTensor.cuh>
@@ -182,8 +183,7 @@ void GpuIndexRefine::searchImpl_(
     Tensor<idx_t, 1, true> baseLabels1D = baseLabels.view<1>({n * k_base});
     flatData->reconstruct(baseLabels1D, candidates);
 
-    // Step 3: For each query, compute exact distances and select top-k
-    // Copy queries to device
+    // Step 3: Copy queries to device
     auto queriesDevice = toDeviceTemporary<float, 2>(
             resources_.get(),
             config_.device,
@@ -191,7 +191,41 @@ void GpuIndexRefine::searchImpl_(
             stream,
             {n, this->d});
 
-    // Allocate output tensors on device
+    // Step 4: Batch compute exact distances for all queries
+    // For each query i, compute distance to its k_base candidates
+    DeviceTensor<float, 2, true> exactDistances(
+            resources_.get(),
+            makeTempAlloc(AllocType::Other, stream),
+            {n, k_base});
+
+    bool isL2 = (metric_type == faiss::MetricType::METRIC_L2) ||
+                (metric_type == faiss::MetricType::METRIC_Lp && metric_arg == 2);
+
+    if (isL2) {
+        runBatchedRerankL2Distance(
+                resources_.get(),
+                stream,
+                queriesDevice,
+                candidates,
+                exactDistances,
+                n,
+                k_base,
+                this->d);
+    } else {
+        // Inner product or other metrics
+        runBatchedRerankIPDistance(
+                resources_.get(),
+                stream,
+                queriesDevice,
+                candidates,
+                exactDistances,
+                n,
+                k_base,
+                this->d);
+    }
+
+    // Step 5: Batch top-k selection with index remapping
+    // Select top-k from each row and remap indices to original database IDs
     DeviceTensor<float, 2, true> outDistancesDevice(
             resources_.get(),
             makeTempAlloc(AllocType::Other, stream),
@@ -201,86 +235,19 @@ void GpuIndexRefine::searchImpl_(
             makeTempAlloc(AllocType::Other, stream),
             {n, k});
 
-    // Process each query: compute distances to its candidates and select top-k
-    for (idx_t i = 0; i < n; i++) {
-        // Get query i
-        Tensor<float, 2, true> query = queriesDevice.narrowOutermost(i, 1);
+    runBatchedTopKRemap(
+            resources_.get(),
+            stream,
+            exactDistances,
+            baseLabels,
+            outDistancesDevice,
+            outLabelsDevice,
+            n,
+            k_base,
+            k,
+            isL2);  // selectMin=true for L2, false for IP
 
-        // Get candidates for query i
-        Tensor<float, 2, true> queryCandidates =
-                candidates.narrowOutermost(i * k_base, k_base);
-
-        // Temporary output for this query
-        DeviceTensor<float, 2, true> queryOutDist(
-                resources_.get(),
-                makeTempAlloc(AllocType::Other, stream),
-                {1, k});
-        DeviceTensor<idx_t, 2, true> queryOutIdx(
-                resources_.get(),
-                makeTempAlloc(AllocType::Other, stream),
-                {1, k});
-
-        // Use bfKnnOnDevice to compute top-k from the candidates
-        // This computes distances and selects top-k in one operation
-        bfKnnOnDevice<float>(
-                resources_.get(),
-                config_.device,
-                stream,
-                queryCandidates,  // database: candidates for this query
-                true,  // row major
-                nullptr,  // no precomputed norms
-                query,  // query
-                true,  // row major
-                k,  // we want top-k
-                metric_type,
-                metric_arg,
-                queryOutDist,
-                queryOutIdx,
-                false);  // don't ignore distances
-
-        // The indices from bfKnnOnDevice are local (0 to k_base-1)
-        // We need to map them back to the original database indices using baseLabels
-        // Copy results to host, remap indices, and copy back
-
-        // Copy local indices to host
-        std::vector<idx_t> localIdx(k);
-        fromDevice(queryOutIdx.data(), localIdx.data(), k, stream);
-        cudaStreamSynchronize(stream);
-
-        // Copy baseLabels for this query to host
-        std::vector<idx_t> baseLab(k_base);
-        fromDevice(baseLabels.data() + i * k_base, baseLab.data(), k_base, stream);
-        cudaStreamSynchronize(stream);
-
-        // Remap indices
-        std::vector<idx_t> remappedIdx(k);
-        for (int j = 0; j < k; j++) {
-            idx_t localIndex = localIdx[j];
-            if (localIndex >= 0 && localIndex < k_base) {
-                remappedIdx[j] = baseLab[localIndex];
-            } else {
-                remappedIdx[j] = -1;
-            }
-        }
-
-        // Copy remapped indices back to device output
-        cudaMemcpyAsync(
-                outLabelsDevice.data() + i * k,
-                remappedIdx.data(),
-                k * sizeof(idx_t),
-                cudaMemcpyHostToDevice,
-                stream);
-
-        // Copy distances to output
-        cudaMemcpyAsync(
-                outDistancesDevice.data() + i * k,
-                queryOutDist.data(),
-                k * sizeof(float),
-                cudaMemcpyDeviceToDevice,
-                stream);
-    }
-
-    // Copy final results to host output
+    // Step 6: Copy final results to host output (single sync at the end)
     fromDevice<float, 2>(outDistancesDevice, distances, stream);
     fromDevice<idx_t, 2>(outLabelsDevice, labels, stream);
 
