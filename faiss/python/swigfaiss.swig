@@ -310,6 +310,7 @@ void gpu_sync_all_devices();
 #include <faiss/gpu/GpuIndexIVFFlat.h>
 #include <faiss/gpu/GpuIndexIVFScalarQuantizer.h>
 #include <faiss/gpu/GpuIndexBinaryFlat.h>
+#include <faiss/gpu/GpuIndexRefine.h>
 #include <faiss/gpu/GpuAutoTune.h>
 #include <faiss/gpu/GpuCloner.h>
 #include <faiss/gpu/GpuDistance.h>
@@ -563,6 +564,7 @@ struct faiss::simd16uint16 {};
 %include  <faiss/gpu/GpuIndexIVFFlat.h>
 %include  <faiss/gpu/GpuIndexIVFScalarQuantizer.h>
 %include  <faiss/gpu/GpuIndexBinaryFlat.h>
+%include  <faiss/gpu/GpuIndexRefine.h>
 %include  <faiss/gpu/GpuDistance.h>
 %include  <faiss/gpu/GpuIcmEncoder.h>
 
