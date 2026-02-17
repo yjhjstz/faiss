@@ -8,6 +8,7 @@
 #include <faiss/gpu/GpuIndexRefine.h>
 #include <faiss/gpu/GpuResources.h>
 #include <faiss/gpu/impl/FlatIndex.cuh>
+#include <faiss/gpu/impl/FlatIndexSQ.cuh>
 #include <faiss/gpu/impl/Distance.cuh>
 #include <faiss/gpu/impl/RerankKernels.cuh>
 #include <faiss/gpu/utils/DeviceUtils.h>
@@ -69,8 +70,60 @@ void GpuIndexRefine::init_(
     ownRefineIndex_ = false;
     k_factor_ = config.k_factor;
     config_ = config;
+    useSQ_ = false;
 
     // Copy ntotal from base index
+    this->ntotal = baseIndex->ntotal;
+    this->is_trained = baseIndex->is_trained;
+}
+
+GpuIndexRefine::GpuIndexRefine(
+        GpuResourcesProvider* provider,
+        GpuIndex* baseIndex,
+        GpuIndexRefineConfig config)
+        : GpuIndex(
+                  provider->getResources(),
+                  baseIndex->d,
+                  baseIndex->metric_type,
+                  baseIndex->metric_arg,
+                  config) {
+    initSQ_(baseIndex, config);
+}
+
+GpuIndexRefine::GpuIndexRefine(
+        std::shared_ptr<GpuResources> resources,
+        GpuIndex* baseIndex,
+        GpuIndexRefineConfig config)
+        : GpuIndex(
+                  resources,
+                  baseIndex->d,
+                  baseIndex->metric_type,
+                  baseIndex->metric_arg,
+                  config) {
+    initSQ_(baseIndex, config);
+}
+
+void GpuIndexRefine::initSQ_(
+        GpuIndex* baseIndex,
+        GpuIndexRefineConfig config) {
+    FAISS_THROW_IF_NOT(baseIndex);
+    FAISS_THROW_IF_NOT_MSG(
+            config.storageType == RefineStorageType::SQ8,
+            "GpuIndexRefine: this constructor requires SQ8 storage type");
+
+    baseIndex_ = baseIndex;
+    refineIndex_ = nullptr;
+    refineIndexSQ_ = std::make_unique<FlatIndexSQ>(
+            resources_.get(),
+            baseIndex->d,
+            ScalarQuantizer::QT_8bit,
+            MemorySpace::Device);
+    ownBaseIndex_ = false;
+    ownRefineIndex_ = false;
+    k_factor_ = config.k_factor;
+    config_ = config;
+    useSQ_ = true;
+
     this->ntotal = baseIndex->ntotal;
     this->is_trained = baseIndex->is_trained;
 }
@@ -90,7 +143,9 @@ void GpuIndexRefine::reset() {
     if (baseIndex_) {
         baseIndex_->reset();
     }
-    if (refineIndex_) {
+    if (useSQ_ && refineIndexSQ_) {
+        refineIndexSQ_->reset();
+    } else if (refineIndex_) {
         refineIndex_->reset();
     }
     this->ntotal = 0;
@@ -100,7 +155,9 @@ void GpuIndexRefine::train(idx_t n, const float* x) {
     if (baseIndex_) {
         baseIndex_->train(n, x);
     }
-    if (refineIndex_) {
+    if (useSQ_ && refineIndexSQ_) {
+        refineIndexSQ_->train(n, x);
+    } else if (refineIndex_) {
         refineIndex_->train(n, x);
     }
     this->is_trained = true;
@@ -123,10 +180,15 @@ void GpuIndexRefine::addImpl_(idx_t n, const float* x, const idx_t* ids) {
     // Add to both indexes
     FAISS_THROW_IF_NOT_MSG(!ids, "add_with_ids not supported for GpuIndexRefine");
 
+    DeviceScope scope(config_.device);
+    auto stream = resources_->getDefaultStream(config_.device);
+
     if (baseIndex_) {
         baseIndex_->add(n, x);
     }
-    if (refineIndex_) {
+    if (useSQ_ && refineIndexSQ_) {
+        refineIndexSQ_->add(n, x, stream);
+    } else if (refineIndex_) {
         refineIndex_->add(n, x);
     }
     this->ntotal += n;
@@ -140,7 +202,7 @@ void GpuIndexRefine::searchImpl_(
         idx_t* labels,
         const SearchParameters* params) const {
     FAISS_THROW_IF_NOT(baseIndex_);
-    FAISS_THROW_IF_NOT(refineIndex_);
+    FAISS_THROW_IF_NOT(useSQ_ ? (bool)refineIndexSQ_ : (bool)refineIndex_);
 
     DeviceScope scope(config_.device);
     auto stream = resources_->getDefaultStream(config_.device);
@@ -176,12 +238,18 @@ void GpuIndexRefine::searchImpl_(
             makeTempAlloc(AllocType::Other, stream),
             {n * k_base, this->d});
 
-    FlatIndex* flatData = refineIndex_->getGpuData();
-    FAISS_THROW_IF_NOT(flatData);
-
     // Reshape baseLabels to 1D for reconstruct call
     Tensor<idx_t, 1, true> baseLabels1D = baseLabels.view<1>({n * k_base});
-    flatData->reconstruct(baseLabels1D, candidates);
+
+    if (useSQ_ && refineIndexSQ_) {
+        // SQ8 storage: reconstruct with decode
+        refineIndexSQ_->reconstruct(baseLabels1D, candidates, stream);
+    } else {
+        // Float storage
+        FlatIndex* flatData = refineIndex_->getGpuData();
+        FAISS_THROW_IF_NOT(flatData);
+        flatData->reconstruct(baseLabels1D, candidates);
+    }
 
     // Step 3: Copy queries to device
     auto queriesDevice = toDeviceTemporary<float, 2>(

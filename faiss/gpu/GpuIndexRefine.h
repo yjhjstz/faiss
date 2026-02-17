@@ -9,6 +9,7 @@
 
 #include <faiss/gpu/GpuIndex.h>
 #include <faiss/gpu/GpuIndexFlat.h>
+#include <memory>
 
 namespace faiss {
 
@@ -16,9 +17,21 @@ struct IndexRefine;
 
 namespace gpu {
 
+class FlatIndexSQ;
+
+/// Storage type for refine index
+enum class RefineStorageType {
+    FLOAT32,    // GpuIndexFlat with float32
+    FLOAT16,    // GpuIndexFlat with float16
+    SQ8         // FlatIndexSQ with 8-bit scalar quantization
+};
+
 struct GpuIndexRefineConfig : public GpuIndexConfig {
     /// Oversampling factor: search k * k_factor candidates, refine to k
     float k_factor = 1.0f;
+
+    /// Storage type for refine vectors (only used with SQ8 constructor)
+    RefineStorageType storageType = RefineStorageType::FLOAT16;
 };
 
 /// GPU implementation of IndexRefine
@@ -43,6 +56,19 @@ class GpuIndexRefine : public GpuIndex {
             GpuIndex* baseIndex,
             GpuIndexFlat* refineIndex,
             GpuIndexRefineConfig config = GpuIndexRefineConfig());
+
+    /// Construct with SQ8 storage for refine (memory efficient)
+    /// This creates an internal FlatIndexSQ for refine storage
+    GpuIndexRefine(
+            GpuResourcesProvider* provider,
+            GpuIndex* baseIndex,
+            GpuIndexRefineConfig config);
+
+    /// Construct with SQ8 storage from shared_ptr resources
+    GpuIndexRefine(
+            std::shared_ptr<GpuResources> resources,
+            GpuIndex* baseIndex,
+            GpuIndexRefineConfig config);
 
     ~GpuIndexRefine() override;
 
@@ -91,11 +117,19 @@ class GpuIndexRefine : public GpuIndex {
             GpuIndexFlat* refineIndex,
             GpuIndexRefineConfig config);
 
+    /// Initialize with SQ8 storage
+    void initSQ_(
+            GpuIndex* baseIndex,
+            GpuIndexRefineConfig config);
+
     /// Fast approximate search index
     GpuIndex* baseIndex_;
 
-    /// Exact refinement index
+    /// Exact refinement index (used when storageType != SQ8)
     GpuIndexFlat* refineIndex_;
+
+    /// SQ8 refinement storage (used when storageType == SQ8)
+    std::unique_ptr<FlatIndexSQ> refineIndexSQ_;
 
     /// Whether we own the base index
     bool ownBaseIndex_;
@@ -108,6 +142,9 @@ class GpuIndexRefine : public GpuIndex {
 
     /// Configuration
     GpuIndexRefineConfig config_;
+
+    /// Whether using SQ8 storage
+    bool useSQ_;
 };
 
 } // namespace gpu
