@@ -113,19 +113,19 @@ def test_sq8_vs_float16(xb, xq, gt, config):
     mem_init = get_gpu_memory_mb()
     print(f"\n初始显存: {mem_init} MB")
 
-    # 创建 IVF-PQ 索引
-    print("\n创建 IVF-PQ 索引...")
-    quantizer = faiss.IndexFlatL2(d)
-    index_cpu = faiss.IndexIVFPQ(quantizer, d, nlist, m, nbits)
-
+    # 直接在 GPU 上训练 IVF-PQ 索引
+    print("\n创建 GpuIndexIVFPQ 并在 GPU 上训练...")
     train_size = min(nb, nlist * 40)
-    index_cpu.train(xb[:train_size])
-    index_cpu.add(xb)
-
-    co = faiss.GpuClonerOptions()
-    co.useFloat16 = True
-    index_gpu = faiss.index_cpu_to_gpu(res, 0, index_cpu, co)
+    t_train = time.time()
+    cfg_pq = faiss.GpuIndexIVFPQConfig()
+    cfg_pq.useFloat16LookupTables = True
+    cfg_pq.device = 0
+    index_gpu = faiss.GpuIndexIVFPQ(
+        res, d, nlist, m, nbits, faiss.METRIC_L2, cfg_pq)
+    index_gpu.train(xb[:train_size])
+    index_gpu.add(xb)
     index_gpu.nprobe = nprobe
+    print(f"GPU 训练+add 完成，耗时 {time.time() - t_train:.1f}s")
 
     mem_after_base = get_gpu_memory_mb()
     print(f"Base index 后显存: {mem_after_base} MB (+{mem_after_base - mem_init} MB)")
@@ -169,16 +169,17 @@ def test_sq8_vs_float16(xb, xq, gt, config):
     print(f"\n--- SQ8 GpuIndexRefine ---")
 
     # SQ8 需要创建新的 base index，通过 GpuIndexRefine.add() 同时添加
-    print("  创建新的 IVF-PQ base (用于 SQ8)...")
-    quantizer2 = faiss.IndexFlatL2(d)
-    index_cpu2 = faiss.IndexIVFPQ(quantizer2, d, nlist, m, nbits)
-    index_cpu2.train(xb[:train_size])
-    # 不要在这里 add，让 GpuIndexRefine.add() 来添加
-
-    co2 = faiss.GpuClonerOptions()
-    co2.useFloat16 = True
-    index_gpu2 = faiss.index_cpu_to_gpu(res, 0, index_cpu2, co2)
+    print("  创建新的 GpuIndexIVFPQ base (用于 SQ8)，GPU 上训练...")
+    t_train2 = time.time()
+    cfg_pq2 = faiss.GpuIndexIVFPQConfig()
+    cfg_pq2.useFloat16LookupTables = True
+    cfg_pq2.device = 0
+    index_gpu2 = faiss.GpuIndexIVFPQ(
+        res, d, nlist, m, nbits, faiss.METRIC_L2, cfg_pq2)
+    index_gpu2.train(xb[:train_size])
+    # 不要在这里 add，让 GpuIndexRefine.add() 来同时添加到 base 和 SQ8
     index_gpu2.nprobe = nprobe
+    print(f"  GPU 训练完成，耗时 {time.time() - t_train2:.1f}s")
 
     cfg = faiss.GpuIndexRefineConfig()
     cfg.storageType = faiss.RefineStorageType_SQ8
