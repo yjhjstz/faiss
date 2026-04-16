@@ -18,7 +18,8 @@ namespace faiss {
 namespace gpu {
 
 /// GPU storage for SQ-encoded vectors
-/// Stores vectors in 8-bit scalar quantized format
+/// Supports 8-bit (QT_8bit / QT_8bit_uniform) and
+/// 4-bit (QT_4bit / QT_4bit_uniform) scalar quantized formats.
 class FlatIndexSQ {
    public:
     FlatIndexSQ(
@@ -69,6 +70,8 @@ class FlatIndexSQ {
     GpuResources* resources_;
     int dim_;
     ScalarQuantizer::QuantizerType qtype_;
+    /// Bytes per encoded vector: dim for 8-bit, (dim+1)/2 for 4-bit.
+    int codeSize_;
     MemorySpace space_;
     bool trained_;
     idx_t numVecs_;
@@ -80,7 +83,7 @@ class FlatIndexSQ {
     DeviceVector<float> vmin_;
     DeviceVector<float> vdiff_;
 
-    /// Encoded vectors (numVecs * dim bytes for QT_8bit)
+    /// Encoded vectors (numVecs * codeSize_ bytes)
     DeviceVector<uint8_t> codes_;
 };
 

@@ -23,7 +23,8 @@ class FlatIndexSQ;
 enum class RefineStorageType {
     FLOAT32,    // GpuIndexFlat with float32
     FLOAT16,    // GpuIndexFlat with float16
-    SQ8         // FlatIndexSQ with 8-bit scalar quantization
+    SQ8,        // FlatIndexSQ with 8-bit scalar quantization
+    SQ4         // FlatIndexSQ with 4-bit scalar quantization
 };
 
 struct GpuIndexRefineConfig : public GpuIndexConfig {
@@ -57,14 +58,15 @@ class GpuIndexRefine : public GpuIndex {
             GpuIndexFlat* refineIndex,
             GpuIndexRefineConfig config = GpuIndexRefineConfig());
 
-    /// Construct with SQ8 storage for refine (memory efficient)
-    /// This creates an internal FlatIndexSQ for refine storage
+    /// Construct with SQ (SQ4 or SQ8) storage for refine (memory efficient).
+    /// This creates an internal FlatIndexSQ for refine storage.
+    /// The storage type is selected via config.storageType.
     GpuIndexRefine(
             GpuResourcesProvider* provider,
             GpuIndex* baseIndex,
             GpuIndexRefineConfig config);
 
-    /// Construct with SQ8 storage from shared_ptr resources
+    /// Construct with SQ (SQ4 or SQ8) storage from shared_ptr resources
     GpuIndexRefine(
             std::shared_ptr<GpuResources> resources,
             GpuIndex* baseIndex,
@@ -117,7 +119,7 @@ class GpuIndexRefine : public GpuIndex {
             GpuIndexFlat* refineIndex,
             GpuIndexRefineConfig config);
 
-    /// Initialize with SQ8 storage
+    /// Initialize with SQ4/SQ8 storage
     void initSQ_(
             GpuIndex* baseIndex,
             GpuIndexRefineConfig config);
@@ -128,7 +130,7 @@ class GpuIndexRefine : public GpuIndex {
     /// Exact refinement index (used when storageType != SQ8)
     GpuIndexFlat* refineIndex_;
 
-    /// SQ8 refinement storage (used when storageType == SQ8)
+    /// SQ refinement storage (used when storageType == SQ4 or SQ8)
     std::unique_ptr<FlatIndexSQ> refineIndexSQ_;
 
     /// Whether we own the base index
@@ -143,7 +145,7 @@ class GpuIndexRefine : public GpuIndex {
     /// Configuration
     GpuIndexRefineConfig config_;
 
-    /// Whether using SQ8 storage
+    /// Whether using SQ (SQ4/SQ8) storage
     bool useSQ_;
 };
 

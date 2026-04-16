@@ -108,15 +108,22 @@ void GpuIndexRefine::initSQ_(
         GpuIndexRefineConfig config) {
     FAISS_THROW_IF_NOT(baseIndex);
     FAISS_THROW_IF_NOT_MSG(
-            config.storageType == RefineStorageType::SQ8,
-            "GpuIndexRefine: this constructor requires SQ8 storage type");
+            config.storageType == RefineStorageType::SQ8 ||
+                    config.storageType == RefineStorageType::SQ4,
+            "GpuIndexRefine: this constructor requires SQ4 or SQ8 "
+            "storage type");
+
+    ScalarQuantizer::QuantizerType qtype =
+            (config.storageType == RefineStorageType::SQ4)
+                    ? ScalarQuantizer::QT_4bit
+                    : ScalarQuantizer::QT_8bit;
 
     baseIndex_ = baseIndex;
     refineIndex_ = nullptr;
     refineIndexSQ_ = std::make_unique<FlatIndexSQ>(
             resources_.get(),
             baseIndex->d,
-            ScalarQuantizer::QT_8bit,
+            qtype,
             MemorySpace::Device);
     ownBaseIndex_ = false;
     ownRefineIndex_ = false;

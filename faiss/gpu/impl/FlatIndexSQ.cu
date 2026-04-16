@@ -38,6 +38,41 @@ __global__ void encodeSQ8Kernel(
     }
 }
 
+// Kernel to encode float vectors to SQ4 (two 4-bit codes packed per byte)
+__global__ void encodeSQ4Kernel(
+        const float* __restrict__ input,  // (n, d)
+        uint8_t* __restrict__ output,     // (n, codeSize)
+        const float* __restrict__ vmin,   // (d)
+        const float* __restrict__ vdiff,  // (d)
+        idx_t n,
+        int d,
+        int codeSize) {
+    idx_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    idx_t total = n * (idx_t)codeSize;
+
+    for (; idx < total; idx += gridDim.x * blockDim.x) {
+        idx_t row = idx / codeSize;
+        int col = idx - row * codeSize; // byte index within row
+        int dim0 = col * 2;
+        int dim1 = dim0 + 1;
+
+        float v0 = input[row * d + dim0];
+        float x0 = (v0 - vmin[dim0]) / vdiff[dim0];
+        x0 = fminf(1.0f, fmaxf(0.0f, x0));
+        uint8_t c0 = (uint8_t)(x0 * 15.0f);
+
+        uint8_t c1 = 0;
+        if (dim1 < d) {
+            float v1 = input[row * d + dim1];
+            float x1 = (v1 - vmin[dim1]) / vdiff[dim1];
+            x1 = fminf(1.0f, fmaxf(0.0f, x1));
+            c1 = (uint8_t)(x1 * 15.0f);
+        }
+
+        output[idx] = (uint8_t)((c0 & 0xf) | ((c1 & 0xf) << 4));
+    }
+}
+
 // Kernel to decode SQ8 vectors to float, with index gather
 __global__ void decodeSQ8GatherKernel(
         const uint8_t* __restrict__ codes,  // (total_vecs, d)
@@ -72,6 +107,41 @@ __global__ void decodeSQ8GatherKernel(
     }
 }
 
+// Kernel to decode SQ4 vectors to float, with index gather
+__global__ void decodeSQ4GatherKernel(
+        const uint8_t* __restrict__ codes,  // (total_vecs, codeSize)
+        const idx_t* __restrict__ indices,  // (n)
+        float* __restrict__ output,         // (n, d)
+        const float* __restrict__ vmin,     // (d)
+        const float* __restrict__ vdiff,    // (d)
+        idx_t n,
+        int d,
+        int codeSize,
+        idx_t numVecs) {
+    idx_t row = blockIdx.x;
+    if (row >= n) return;
+
+    idx_t srcIdx = indices[row];
+    if (srcIdx < 0 || srcIdx >= numVecs) {
+        for (int i = threadIdx.x; i < d; i += blockDim.x) {
+            output[row * d + i] = 0.0f;
+        }
+        return;
+    }
+
+    const uint8_t* srcRow = codes + srcIdx * (idx_t)codeSize;
+    float* dstRow = output + row * d;
+
+    // Decode: vmin + (code + 0.5) / 15 * vdiff
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        uint8_t byte = srcRow[i >> 1];
+        uint8_t code = (byte >> ((i & 1) << 2)) & 0xf;
+        float vd = vdiff[i] / 15.0f;
+        float vm = vmin[i] + 0.5f * vd;
+        dstRow[i] = vm + (float)code * vd;
+    }
+}
+
 FlatIndexSQ::FlatIndexSQ(
         GpuResources* res,
         int dim,
@@ -80,6 +150,11 @@ FlatIndexSQ::FlatIndexSQ(
         : resources_(res),
           dim_(dim),
           qtype_(qtype),
+          codeSize_(
+                  (qtype == ScalarQuantizer::QT_4bit ||
+                   qtype == ScalarQuantizer::QT_4bit_uniform)
+                          ? (dim + 1) / 2
+                          : dim),
           space_(space),
           trained_(false),
           numVecs_(0),
@@ -89,8 +164,11 @@ FlatIndexSQ::FlatIndexSQ(
           codes_(res, AllocInfo(AllocType::Other, 0, space, res->getDefaultStreamCurrentDevice())) {
     FAISS_THROW_IF_NOT_MSG(
             qtype == ScalarQuantizer::QT_8bit ||
-            qtype == ScalarQuantizer::QT_8bit_uniform,
-            "FlatIndexSQ only supports QT_8bit and QT_8bit_uniform");
+            qtype == ScalarQuantizer::QT_8bit_uniform ||
+            qtype == ScalarQuantizer::QT_4bit ||
+            qtype == ScalarQuantizer::QT_4bit_uniform,
+            "FlatIndexSQ supports QT_8bit, QT_8bit_uniform, "
+            "QT_4bit and QT_4bit_uniform");
 }
 
 FlatIndexSQ::~FlatIndexSQ() = default;
@@ -103,7 +181,11 @@ void FlatIndexSQ::train(idx_t n, const float* x) {
     // Copy trained parameters to GPU
     auto stream = resources_->getDefaultStreamCurrentDevice();
 
-    if (qtype_ == ScalarQuantizer::QT_8bit) {
+    bool isUniform =
+            (qtype_ == ScalarQuantizer::QT_8bit_uniform ||
+             qtype_ == ScalarQuantizer::QT_4bit_uniform);
+
+    if (!isUniform) {
         // Per-dimension min/diff
         vmin_.resize(dim_, stream);
         vdiff_.resize(dim_, stream);
@@ -143,9 +225,16 @@ void FlatIndexSQ::add(idx_t n, const float* x, cudaStream_t stream) {
 
     if (n == 0) return;
 
-    // Resize codes buffer
+    bool is4bit =
+            (qtype_ == ScalarQuantizer::QT_4bit ||
+             qtype_ == ScalarQuantizer::QT_4bit_uniform);
+    bool isUniform =
+            (qtype_ == ScalarQuantizer::QT_8bit_uniform ||
+             qtype_ == ScalarQuantizer::QT_4bit_uniform);
+
+    // Resize codes buffer (in bytes)
     idx_t newSize = numVecs_ + n;
-    codes_.resize(newSize * dim_, stream);
+    codes_.resize(newSize * (idx_t)codeSize_, stream);
 
     // Copy input to device
     DeviceTensor<float, 2, true> inputDevice(
@@ -159,14 +248,7 @@ void FlatIndexSQ::add(idx_t n, const float* x, cudaStream_t stream) {
             cudaMemcpyHostToDevice,
             stream));
 
-    // Encode on GPU
-    int threads = 256;
-    int blocks = std::min((int)utils::divUp(n * dim_, (idx_t)threads), 65535);
-
-    // For QT_8bit_uniform, we need to broadcast vmin/vdiff
-    // For simplicity, we'll use a kernel that handles per-dimension case
-    // and just replicate for uniform
-
+    // Broadcast vmin/vdiff so we can always index per-dimension in kernels
     DeviceTensor<float, 1, true> vminBcast(
             resources_,
             makeTempAlloc(AllocType::Other, stream),
@@ -176,7 +258,7 @@ void FlatIndexSQ::add(idx_t n, const float* x, cudaStream_t stream) {
             makeTempAlloc(AllocType::Other, stream),
             {dim_});
 
-    if (qtype_ == ScalarQuantizer::QT_8bit) {
+    if (!isUniform) {
         CUDA_VERIFY(cudaMemcpyAsync(
                 vminBcast.data(), vmin_.data(),
                 dim_ * sizeof(float), cudaMemcpyDeviceToDevice, stream));
@@ -198,13 +280,30 @@ void FlatIndexSQ::add(idx_t n, const float* x, cudaStream_t stream) {
                      vdiffBcast.data(), vdiffBcast.data() + dim_, vdiffVal);
     }
 
-    encodeSQ8Kernel<<<blocks, threads, 0, stream>>>(
-            inputDevice.data(),
-            codes_.data() + numVecs_ * dim_,
-            vminBcast.data(),
-            vdiffBcast.data(),
-            n,
-            dim_);
+    int threads = 256;
+    if (is4bit) {
+        int blocks = std::min(
+                (int)utils::divUp(n * (idx_t)codeSize_, (idx_t)threads),
+                65535);
+        encodeSQ4Kernel<<<blocks, threads, 0, stream>>>(
+                inputDevice.data(),
+                codes_.data() + numVecs_ * (idx_t)codeSize_,
+                vminBcast.data(),
+                vdiffBcast.data(),
+                n,
+                dim_,
+                codeSize_);
+    } else {
+        int blocks = std::min(
+                (int)utils::divUp(n * (idx_t)dim_, (idx_t)threads), 65535);
+        encodeSQ8Kernel<<<blocks, threads, 0, stream>>>(
+                inputDevice.data(),
+                codes_.data() + numVecs_ * (idx_t)codeSize_,
+                vminBcast.data(),
+                vdiffBcast.data(),
+                n,
+                dim_);
+    }
 
     CUDA_TEST_ERROR();
     numVecs_ = newSize;
@@ -237,7 +336,14 @@ void FlatIndexSQ::reconstruct(
             makeTempAlloc(AllocType::Other, stream),
             {dim_});
 
-    if (qtype_ == ScalarQuantizer::QT_8bit) {
+    bool is4bit =
+            (qtype_ == ScalarQuantizer::QT_4bit ||
+             qtype_ == ScalarQuantizer::QT_4bit_uniform);
+    bool isUniform =
+            (qtype_ == ScalarQuantizer::QT_8bit_uniform ||
+             qtype_ == ScalarQuantizer::QT_4bit_uniform);
+
+    if (!isUniform) {
         CUDA_VERIFY(cudaMemcpyAsync(
                 vminBcast.data(), vmin_.data(),
                 dim_ * sizeof(float), cudaMemcpyDeviceToDevice, stream));
@@ -260,15 +366,28 @@ void FlatIndexSQ::reconstruct(
 
     int threads = 256;
 
-    decodeSQ8GatherKernel<<<n, threads, 0, stream>>>(
-            codes_.data(),
-            keys.data(),
-            out.data(),
-            vminBcast.data(),
-            vdiffBcast.data(),
-            n,
-            dim_,
-            numVecs_);
+    if (is4bit) {
+        decodeSQ4GatherKernel<<<n, threads, 0, stream>>>(
+                codes_.data(),
+                keys.data(),
+                out.data(),
+                vminBcast.data(),
+                vdiffBcast.data(),
+                n,
+                dim_,
+                codeSize_,
+                numVecs_);
+    } else {
+        decodeSQ8GatherKernel<<<n, threads, 0, stream>>>(
+                codes_.data(),
+                keys.data(),
+                out.data(),
+                vminBcast.data(),
+                vdiffBcast.data(),
+                n,
+                dim_,
+                numVecs_);
+    }
 
     CUDA_TEST_ERROR();
 }
